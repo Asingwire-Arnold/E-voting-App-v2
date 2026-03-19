@@ -1,4 +1,5 @@
-from django.contrib.auth import get_user_model
+from django.contrib.auth import get_user_model, update_session_auth_hash
+from django.shortcuts import get_object_or_404
 from rest_framework import generics, status
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
@@ -26,13 +27,12 @@ from accounts.services import (
 
 User = get_user_model()
 
-
 class AdminLoginView(APIView):
     permission_classes = [AllowAny]
     serializer_class = AdminLoginSerializer
 
     def post(self, request):
-        serializer = AdminLoginSerializer(data=request.data)
+        serializer = self.serializer_class(data=request.data)
         serializer.is_valid(raise_exception=True)
 
         service = AuthenticationService()
@@ -62,7 +62,7 @@ class VoterLoginView(APIView):
     serializer_class = VoterLoginSerializer
 
     def post(self, request):
-        serializer = VoterLoginSerializer(data=request.data)
+        serializer = self.serializer_class(data=request.data)
         serializer.is_valid(raise_exception=True)
 
         service = AuthenticationService()
@@ -74,6 +74,10 @@ class VoterLoginView(APIView):
         if error:
             return Response({"detail": error}, status=status.HTTP_401_UNAUTHORIZED)
 
+        # Safety check for the profile relationship
+        voter_card = getattr(user, 'voter_profile', None)
+        card_num = voter_card.voter_card_number if voter_card else "N/A"
+
         refresh = RefreshToken.for_user(user)
         return Response({
             "access": str(refresh.access_token),
@@ -81,7 +85,7 @@ class VoterLoginView(APIView):
             "user": {
                 "id": user.id,
                 "full_name": user.get_full_name(),
-                "voter_card_number": user.voter_profile.voter_card_number,
+                "voter_card_number": card_num,
                 "role": user.role,
             },
         })
@@ -92,25 +96,31 @@ class VoterRegistrationView(APIView):
     serializer_class = VoterRegistrationSerializer
 
     def post(self, request):
-        serializer = VoterRegistrationSerializer(data=request.data)
+        serializer = self.serializer_class(data=request.data)
         serializer.is_valid(raise_exception=True)
 
         service = VoterRegistrationService()
-        profile = service.register(serializer.validated_data)
-
-        return Response(
-            {
-                "detail": "Registration successful. Pending admin verification.",
-                "voter_card_number": profile.voter_card_number,
-            },
-            status=status.HTTP_201_CREATED,
-        )
+        try:
+            profile = service.register(serializer.validated_data)
+            return Response(
+                {
+                    "detail": "Registration successful. Pending admin verification.",
+                    "voter_card_number": profile.voter_card_number,
+                },
+                status=status.HTTP_201_CREATED,
+            )
+        except Exception as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
 
 class VoterProfileView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
+        # Ensure user actually has a profile (prevents 500 if an admin visits this)
+        if not hasattr(request.user, 'voter_profile'):
+            return Response({"detail": "Voter profile not found."}, status=status.HTTP_404_NOT_FOUND)
+            
         serializer = VoterProfileSerializer(request.user.voter_profile)
         return Response(serializer.data)
 
@@ -120,7 +130,7 @@ class ChangePasswordView(APIView):
     serializer_class = ChangePasswordSerializer
 
     def post(self, request):
-        serializer = ChangePasswordSerializer(data=request.data)
+        serializer = self.serializer_class(data=request.data)
         serializer.is_valid(raise_exception=True)
 
         if not request.user.check_password(serializer.validated_data["current_password"]):
@@ -131,6 +141,9 @@ class ChangePasswordView(APIView):
 
         request.user.set_password(serializer.validated_data["new_password"])
         request.user.save()
+        
+        # Recommended to keep the user's session valid if using session middleware
+        update_session_auth_hash(request, request.user)
 
         return Response({"detail": "Password changed successfully."})
 
@@ -149,7 +162,9 @@ class VoterVerifyView(APIView):
 
     def post(self, request, pk):
         service = VoterManagementService()
-        service.verify(pk, request.user)
+        user = service.verify(pk, request.user)
+        if not user:
+            return Response({"detail": "Voter not found."}, status=status.HTTP_404_NOT_FOUND)
         return Response({"detail": "Voter verified successfully."})
 
 
@@ -167,9 +182,8 @@ class VoterDeactivateView(APIView):
 
     def post(self, request, pk):
         service = VoterManagementService()
-        try:
-            service.deactivate(pk, request.user)
-        except User.DoesNotExist:
+        result = service.deactivate(pk, request.user)
+        if not result:
             return Response({"detail": "Voter not found."}, status=status.HTTP_404_NOT_FOUND)
         return Response({"detail": "Voter deactivated."})
 
@@ -179,6 +193,7 @@ class AdminListView(generics.ListAPIView):
     serializer_class = AdminListSerializer
 
     def get_queryset(self):
+        # Added .order_by for consistent pagination and filter for roles
         return User.objects.filter(role__in=User.ADMIN_ROLES).order_by("-date_joined")
 
 
@@ -187,30 +202,34 @@ class AdminCreateView(APIView):
     serializer_class = AdminCreateSerializer
 
     def post(self, request):
-        serializer = AdminCreateSerializer(data=request.data)
+        serializer = self.serializer_class(data=request.data)
         serializer.is_valid(raise_exception=True)
 
         service = AdminManagementService()
-        admin_user = service.create_admin(serializer.validated_data, request.user)
-
-        return Response(
-            {
-                "detail": f"Admin '{admin_user.username}' created with role: {admin_user.role}",
-                "id": admin_user.id,
-            },
-            status=status.HTTP_201_CREATED,
-        )
+        try:
+            admin_user = service.create_admin(serializer.validated_data, request.user)
+            return Response(
+                {
+                    "detail": f"Admin '{admin_user.username}' created with role: {admin_user.role}",
+                    "id": admin_user.id,
+                },
+                status=status.HTTP_201_CREATED,
+            )
+        except Exception as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
 
 class AdminDeactivateView(APIView):
     permission_classes = [IsSuperAdmin]
 
     def post(self, request, pk):
-        if pk == request.user.pk:
+        if str(pk) == str(request.user.pk):
             return Response(
                 {"detail": "Cannot deactivate your own account."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         service = AdminManagementService()
-        service.deactivate(pk, request.user)
+        result = service.deactivate(pk, request.user)
+        if not result:
+             return Response({"detail": "Admin not found."}, status=status.HTTP_404_NOT_FOUND)
         return Response({"detail": "Admin deactivated."})
