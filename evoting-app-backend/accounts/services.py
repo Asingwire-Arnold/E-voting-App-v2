@@ -1,12 +1,11 @@
 from django.contrib.auth import get_user_model
 from django.db import transaction
-
+from django.core.exceptions import ObjectDoesNotExist
 from accounts.models import VoterProfile
 from audit.services import AuditService
 from elections.models import VotingStation
 
 User = get_user_model()
-
 
 class AuthenticationService:
     def __init__(self):
@@ -14,6 +13,7 @@ class AuthenticationService:
 
     def authenticate_admin(self, username, password):
         try:
+            # Use filter().first() or get() with specific error handling
             user = User.objects.get(username=username)
         except User.DoesNotExist:
             self._audit.log("LOGIN_FAILED", username, "Invalid admin credentials")
@@ -23,7 +23,8 @@ class AuthenticationService:
             self._audit.log("LOGIN_FAILED", username, "Wrong password")
             return None, "Invalid credentials."
 
-        if not user.is_admin_user:
+        # Verify the user actually has an admin-level role
+        if not (user.is_staff or getattr(user, 'is_admin_user', False)):
             self._audit.log("LOGIN_FAILED", username, "Not an admin account")
             return None, "This is not an admin account."
 
@@ -36,6 +37,7 @@ class AuthenticationService:
 
     def authenticate_voter(self, voter_card_number, password):
         try:
+            # Optimization: select_related reduces DB queries for the joined User table
             profile = VoterProfile.objects.select_related("user").get(
                 voter_card_number=voter_card_number
             )
@@ -65,10 +67,18 @@ class VoterRegistrationService:
     def __init__(self):
         self._audit = AuditService()
 
+    @transaction.atomic
     def register(self, validated_data):
-        names = validated_data["full_name"].split(" ", 1)
-        station = VotingStation.objects.get(pk=validated_data["station_id"])
+        # Clean input and handle potential splitting errors
+        full_name = validated_data["full_name"].strip()
+        names = full_name.split(" ", 1)
+        
+        try:
+            station = VotingStation.objects.get(pk=validated_data["station_id"])
+        except VotingStation.DoesNotExist:
+            raise ValueError("Invalid Voting Station ID")
 
+        # Create User first
         user = User.objects.create_user(
             username=validated_data["email"],
             email=validated_data["email"],
@@ -79,6 +89,7 @@ class VoterRegistrationService:
             is_verified=False,
         )
 
+        # Create Profile - if this fails, transaction rolls back User creation
         profile = VoterProfile.objects.create(
             user=user,
             national_id=validated_data["national_id"],
@@ -91,7 +102,7 @@ class VoterRegistrationService:
 
         self._audit.log(
             "REGISTER",
-            validated_data["full_name"],
+            full_name,
             f"New voter registered with card: {profile.voter_card_number}",
         )
         return profile
@@ -103,7 +114,9 @@ class AdminManagementService:
 
     @transaction.atomic
     def create_admin(self, validated_data, created_by):
-        names = validated_data["full_name"].split(" ", 1)
+        full_name = validated_data["full_name"].strip()
+        names = full_name.split(" ", 1)
+        
         user = User.objects.create_user(
             username=validated_data["username"],
             email=validated_data["email"],
@@ -114,6 +127,7 @@ class AdminManagementService:
             is_verified=True,
             is_staff=True,
         )
+        
         self._audit.log(
             "CREATE_ADMIN",
             created_by.username,
@@ -122,15 +136,20 @@ class AdminManagementService:
         return user
 
     def deactivate(self, admin_id, deactivated_by):
-        admin_user = User.objects.get(pk=admin_id)
-        admin_user.is_active = False
-        admin_user.save()
-        self._audit.log(
-            "DEACTIVATE_ADMIN",
-            deactivated_by.username,
-            f"Deactivated admin: {admin_user.username}",
-        )
-        return admin_user
+        try:
+            admin_user = User.objects.get(pk=admin_id)
+            admin_user.is_active = False
+            # Optimization: only update necessary field
+            admin_user.save(update_fields=["is_active"])
+            
+            self._audit.log(
+                "DEACTIVATE_ADMIN",
+                deactivated_by.username,
+                f"Deactivated admin: {admin_user.username}",
+            )
+            return admin_user
+        except User.DoesNotExist:
+            return None
 
 
 class VoterManagementService:
@@ -138,46 +157,62 @@ class VoterManagementService:
         self._audit = AuditService()
 
     def verify(self, voter_id, verified_by):
-        user = User.objects.get(pk=voter_id)
-        user.is_verified = True
-        user.save(update_fields=["is_verified"])
-        self._audit.log(
-            "VERIFY_VOTER",
-            verified_by.username,
-            f"Verified voter: {user.get_full_name()}",
-        )
-        return user
+        try:
+            user = User.objects.get(pk=voter_id)
+            user.is_verified = True
+            user.save(update_fields=["is_verified"])
+            
+            self._audit.log(
+                "VERIFY_VOTER",
+                verified_by.username,
+                f"Verified voter: {user.get_full_name()}",
+            )
+            return user
+        except User.DoesNotExist:
+            return None
 
     def verify_all_pending(self, verified_by):
-        unverified = User.objects.filter(is_verified=False)
+        unverified = User.objects.filter(is_verified=False, role=User.Role.VOTER)
         count = unverified.update(is_verified=True)
-        self._audit.log(
-            "VERIFY_ALL_VOTERS",
-            verified_by.username,
-            f"Verified {count} voters",
-        )
+        
+        if count > 0:
+            self._audit.log(
+                "VERIFY_ALL_VOTERS",
+                verified_by.username,
+                f"Verified {count} voters",
+            )
         return count
 
     def deactivate(self, voter_id, deactivated_by):
-        user = User.objects.get(pk=voter_id, role=User.Role.VOTER)
-        user.is_active = False
-        user.save(update_fields=["is_active"])
-        self._audit.log(
-            "DEACTIVATE_VOTER",
-            deactivated_by.username,
-            f"Deactivated voter: {user.get_full_name()}",
-        )
-        return user
+        try:
+            # Ensure we are only deactivating voters, not accidental admins
+            user = User.objects.get(pk=voter_id, role=User.Role.VOTER)
+            user.is_active = False
+            user.save(update_fields=["is_active"])
+            
+            self._audit.log(
+                "DEACTIVATE_VOTER",
+                deactivated_by.username,
+                f"Deactivated voter: {user.get_full_name()}",
+            )
+            return user
+        except User.DoesNotExist:
+            return None
 
     def search(self, query_params):
+        # select_related avoids the N+1 problem when accessing voter_profile in a list
         qs = User.objects.filter(role=User.Role.VOTER).select_related("voter_profile")
 
         if name := query_params.get("name"):
+            name = name.strip()
             qs = qs.filter(first_name__icontains=name) | qs.filter(last_name__icontains=name)
+        
         if card := query_params.get("card"):
-            qs = qs.filter(voter_profile__voter_card_number=card)
+            qs = qs.filter(voter_profile__voter_card_number=card.strip())
+            
         if nid := query_params.get("national_id"):
-            qs = qs.filter(voter_profile__national_id=nid)
+            qs = qs.filter(voter_profile__national_id=nid.strip())
+            
         if station_id := query_params.get("station_id"):
             qs = qs.filter(voter_profile__station_id=station_id)
 
